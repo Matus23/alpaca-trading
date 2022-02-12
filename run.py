@@ -77,28 +77,30 @@ def get_yesterday():
 
 
 def main():
-    ticker = "BTCUSD" #SPY #BTCUSD 
+    ticker = "SPY" #SPY #BTCUSD # AAPL
     frequency = TimeFrame.Day
     start_date = "2005-01-01"
     end_date = "2022-01-21"
-    portfolio_size = 100000
-    callback = dh.print_trade_update # print_crypto_quote
-    tickers= ['BTCUSD', 'BTCUSD']
-    callbacks = [dh.print_trade, dh.print_quote, dh.print_bar]
-    today = get_today()
+    portfolio_size = 10000
+    #alg = bb.BollingerBands(ticker, portfolio_size, window_size=21)
+    #bb.start_trading(alg)
     yesterday = get_yesterday()
 
-    #back_test_bollinger_bands(ticker, frequency, start_date, end_date, portfolio_size, data)
-    dh.get_real_time_data(ticker, callback)
+    data = dh.get_historical_bar_data(ticker,
+                        frequency=TimeFrame.Minute,
+                        start_date=yesterday,
+                        end_date=yesterday)
+    print(f'data: {data}')
 
-    #data = dh.get_historical_bar_data(ticker, 
-    #                    frequency=TimeFrame.Minute,
-    #                    start_date=yesterday,
-    #                    end_date=yesterday)
+    dh.backtest_bollinger_bands(data)
+    #dh.backtest_bollinger_bands(ticker, frequency, start_date, end_date, portfolio_size, data)
+    #dh.get_real_time_data(ticker, callback)
+
+
     
     #stream.subscribe_trades(print_trade, 'AAPL')
     #stream.subscribe_quotes(print_quote, 'IBM')
     #stream.subscribe_crypto_trades(print_crypto_trade, 'BTCUSD')
 
- 
+
 main()

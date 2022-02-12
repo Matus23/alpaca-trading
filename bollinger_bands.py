@@ -1,6 +1,5 @@
-from alpaca_trade_api.entity import Bars
 import config
-import data_handler as dh
+import back_testing as bt
 import requests
 import yfinance as yf
 import pandas_datareader.data as web
@@ -8,59 +7,160 @@ import numpy as np
 import opstrat as op
 import matplotlib.pyplot as plt
 import pandas as pd
-import re
-import time
-from datetime import datetime, timedelta, date
-import math
 import alpaca_trade_api as tradeapi
+import asyncio
+import logging
+from datetime import datetime, timedelta, date
 from alpaca_trade_api.stream import Stream
 from alpaca_trade_api.common import URL
 from alpaca_trade_api.rest import REST, TimeFrame, TimeFrameUnit
-import nest_asyncio
-import logging
-import threading
-import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from alpaca_trade_api.entity import Bars
 
 
-# Script inspired by:
-# https://medium.com/codex/algorithmic-trading-with-bollinger-bands-in-python-1b0a00c9ef99
-# https://towardsdatascience.com/backtesting-bollinger-bands-on-apple-stock-using-quantopian-6be2e4824f43
+class BollingerBands:
+    """
+    A class used to trade a single ticker (whether stock or crypto) using 
+    Bollinger Bands strategy
 
+    Attributes
+    ----------
+    ticker: String
+        Ticker specifying fin instrument to be traded
+    _portfolio_size: Float
+        Amount of $ used to trade the asset
+    _upper_band: Float
+        Upper bollinger band
+    _lower_band: Float
+        Lower bollinger band
+    _quantity: Float
+        Current quantity of the asset we're in posession of
+    _order_state: String
+        Specifies whether a buy or sell order has been executed
+    _window_size: Int
+        Size of the window for calculating moving average
+    _num_std: Int
+        Number of standard deviations specifying width of the bollinger bands
+    _current_price: Float
+        Current price of the asset. This is assumed to be the close price 
+        of the most recent bar
+    _previous_price: Float
+        Close price of the previous bar. 
+    _frequency: alpaca's custom TimeFrame
+        Used for retrieving historical bar data. Specifies the frequency of the
+        bar data. E.g. Minute, Hour and Day
+    _start_date: String
+        Used for retrieving historical bar data. Specifies the starting date
+        since when the data should be retrieved. 
+    _end_date: String
+        Used for retrieving historical bar data. Specifies the end date
+        until when the data should be retrieved. 
+    _exchange: String
+        Exchange used for gathering real time data about the instrument
 
-class Algorithm:
-    def __init__(self, ticker, api, portfolio_size):
-        self._ticker = ticker
+    Methods
+    -------
+    _initialize_bars_from_historical()
+        Initializes bars using Alpaca's api to retrieve historical data about
+        the asset in specified time period with specified frequency
+    _initialize_bars()
+        Initializes a df for keeping the bar data
+    _calculate_bands()
+        Calculates upper and lower bollinger band
+    _sell()
+        Submits a sell order
+    _buy()
+        Submits a buy order
+    _update_bars(bar)
+        Update bars data when a new bar arrives
+    _execute_bollinger_bands()
+        Executes the trading logic following bollinger bands
+    handle_trade_update()
+        Handler for when a trade is executed and arrives in real-time 
+    handle_bar()
+        Handler for when a new bar comes
+    _handle_filled_order()        
+        Handles trade whose order was successfully filled
+    _handle_partially_filled_order()
+        Handles trade whose order was partially filled
+    _handle_rejected_order()
+        Handles trade whose order was rejected
+    """
+    def __init__(self, ticker, portfolio_size, window_size=20, num_std=1, \
+                frequency=TimeFrame.Minute, start_date="01-01-2022", \
+                end_date="01-01-2022"):
+        self.ticker = ticker
         self._portfolio_size = portfolio_size
-        self._context = {}
-        self._bars = []
-        self._api = api
-        self._yesterday = get_yesterday()
-        self._upper_band = None
-        self._lower_band = None
-        self._quantity = None
+        self._upper_band = 0
+        self._lower_band = 0
+        self._quantity = 0
         self._order_state = None
+        self._window_size = window_size
+        self._num_std = num_std
+        self._exchange = None
+        self._current_price = None
+        self._previous_price = None
+        self._frequency = frequency
+        self._start_date = start_date
+        self._end_date = end_date
+        self._initialize_bars()
+        
 
-    def _initialize_bars(self, window_size=20):
+    def _initialize_bars_from_historical(self):
+        """
+        Initializes bars from historical data
+        """
         # load yesterday's data
-        self._bars = dh.get_historical_bar_data(self._ticker, 
-                        frequency=TimeFrame.Minute,
-                        start_date=self._yesterday,
-                        end_date=self._yesterday)
+        self._bars = bt.get_historical_bar_data(self.ticker, 
+                        frequency=self._frequency,
+                        start_date=self._start_date,
+                        end_date=self._end_date)
 
         # take the last window_size number of minutes
-        self._bars = self._bars.tail(window_size)
+        self._bars = self._bars.tail(self._window_size)
 
-    def _calculate_bands(self, window_size=20, num_std_dev=1):
-        std = self._bars.rolling(window_size, min_periods=1).std()
-        sma = self._bars.rolling(window_size, min_periods=1).mean()
-        
-        self._upper_band = sma + num_std_dev * std
-        self._lower_band = sma - num_std_dev * std
+
+    def _initialize_bars(self):
+        self._bars = pd.DataFrame(data={
+            'close': [],
+            'exchange': [],
+            'high': [],
+            'low': [],
+            'open': [],
+            'symbol': [],
+            'timestamp': [],
+            'trade_count': [],
+            'volume': [],
+            'vwap': []
+        })
+
+
+    def _calculate_bands(self):
+        """
+        Calculates the lower and upper bollinger bands
+        """
+        std = self._bars['vwap'].rolling(self._window_size, min_periods=1).std().iloc[-1]
+        sma = self._bars['vwap'].rolling(self._window_size, min_periods=1).mean().iloc[-1]
+
+        self._upper_band = sma + self._num_std * std
+        self._lower_band = sma - self._num_std * std
+
 
     def _sell(self):
-        self._api.submit_order(
-            symbol=self._ticker,
+        """
+        Submits sell order if currently in possession of the asset
+        and the last submitted order wasn't a sell
+        """
+        # currently in no possession of the asset, can't execute a sell order
+        if self._quantity == 0 or self._order_state == 'sell_submitted':
+            log.info(f'State: {self._order_state}, quantity: {self._quantity}, \
+            portfolio size: {self._portfolio_size}. Exiting sell order.')
+            return
+
+        log.info(f'Selling: {self._quantity} shares of {self.ticker}')
+
+        api.submit_order(
+            symbol=self.ticker,
             qty=self._quantity,
             side='sell',
             type='market',
@@ -69,11 +169,25 @@ class Algorithm:
 
         self._order_state = 'sell_submitted'
 
+
     def _buy(self):
-        quantity_to_buy = math.floor(self._portfolio_size / self._bars['close'][:1])
-        
-        self._api.submit_order(
-            symbol=self._ticker,
+        """
+        Submits buy order if currently in no possession of the asset 
+        and the last submitted order wasn't a buy
+        """
+        # already bought the asset, wait until asset sold to buy again
+        if self._quantity != 0 or self._portfolio_size == 0 or \
+            self._order_state == 'buy_submitted':
+            log.info(f'State: {self._order_state}, quantity: {self._quantity}, \
+            portfolio size: {self._portfolio_size}. Exiting buy order.')
+            return
+
+        quantity_to_buy = self._portfolio_size / self._bars['close'].iloc[-1]
+
+        log.info(f'Buying: {self._quantity} shares of {self.ticker}')
+
+        api.submit_order(
+            symbol=self.ticker,
             qty=quantity_to_buy,
             side='buy',
             type='market',
@@ -84,348 +198,196 @@ class Algorithm:
 
 
     def _update_bars(self, bar):
-        self._bars = self._bars.iloc[1:, :]
-        self._bars = self._bars.append(bar)
-        self._bars.append({
-            'open': bar.open,
+        """
+        Updates the bars with the latest bar
+        """
+        # this bar came from a different exchange -> discard it
+        #if bar.exchange != self._exchange:
+        #    return
+
+        self._bars = self._bars.append({
+            'close': bar.close,
+            'exchange': bar.exchange,
             'high': bar.high,
             'low': bar.low,
-            'close': bar.close,
+            'open': bar.open,
+            'symbol': bar.symbol,
+            'timestamp': bar.timestamp,
+            'trade_count': bar.trade_count,
             'volume': bar.volume,
+            'vwap': bar.vwap
         }, ignore_index=True)
 
-
-    async def _handle_bar(self, bar):
-        self._bollinger_bands(bar)
-
-
-    async def on_trade_update(self, trade):
-        print(f'trade: {trade}')
-
-        # order filled
-        if trade.event == 'fill':
-            if self._order_state == 'buy_submitted':
-                self._quantity = trade.qty
-            else: 
-                # portfolio size = quantity * selling_price
-                self._portfolio_size = trade.qty * trade.price
+        self._previous_price = self._current_price
+        self._current_price  = bar.close 
+        
+        if (len(self._bars) > self._window_size):
+            self._bars = self._bars.tail(self._window_size)
 
 
-    def _bollinger_bands(self, bar):
-        vwap = bar['vwap']
+    def _execute_bollinger_bands(self):
+        """
+        Executes a buy when the current price is below the lower band and 
+        the price in the previous time interval was above the lower band
+        Executes a sell when the current price is above the upper band and
+        the price in the previous time interval was below the upper band
+        """
+        self._calculate_bands()
 
-        if vwap < self._lower_band:
-            self._sell()
-        elif vwap > self._upper_band:
+        if self._current_price < self._lower_band \
+            and self._previous_price > self._lower_band:
             self._buy()
+        elif self._current_price > self._upper_band \
+            and self._previous_price < self._upper_band:
+            self._sell()
 
-        self._update_bars(bar)
+
+    def _handle_filled_order(self, trade):
+        """
+        Called when an order is successfully filled
+        Args:
+            trade: alpaca's Trade object type 
+                trade in which the order got filled
+        """
+        log.info(f"{trade.order['side']} at {trade.price} of size {trade.qty}")
+
+        # buy order filled
+        if trade.order['side'] == 'buy':
+            # update portfolio size and current quantity
+            self._quantity = float(trade.qty)
+            self._portfolio_size -= float(trade.qty) * float(trade.price)
+
+        # sell order filled
+        elif trade.order['side'] == 'sell':
+            # update portfolio size and current quantity
+            self._portfolio_size = float(trade.qty) * float(trade.price)  
+            self._quantity = 0
             
 
+    def _handle_partially_filled_order(self, trade):
+        """ TODO """
+        pass
 
+    def _handle_rejected_order(self, trade):
+        """ TODO """
+        pass
 
-##########################################
-#### Procedural part for backtesting #####
-##########################################
-def get_bands(data, window_size=20, num_std_dev=1):
-    std = data.rolling(window_size, min_periods=1).std()
-    sma = data.rolling(window_size, min_periods=1).mean()
-    
-    upper_band = sma + num_std_dev * std
-    lower_band = sma - num_std_dev * std
-    
-    return lower_band, upper_band
-
-
-def handle_buy(signal, vwap, buys, sells, signals):
-    if signal != 1:
-        buys.append(vwap)
-        sells.append(np.nan)
-        signal = 1
-        signals.append(signal)
-    else:
-        buys.append(np.nan)
-        sells.append(np.nan)
-        signals.append(0)
-
-    return signal
-
-
-def handle_sell(signal, vwap, buys, sells, signals):
-    if signal != -1:
-        buys.append(np.nan)
-        sells.append(vwap)
-        signal = -1
-        signals.append(signal)
-    else:
-        buys.append(np.nan)
-        sells.append(np.nan)
-        signals.append(0)
-
-    return signal
-
-
-def handle_neutral(buys, sells, signals):
-    buys.append(np.nan)
-    sells.append(np.nan)
-    signals.append(0)
-
-
-def bollinger_bands(data, window_size=20, num_std_dev=1):
-    # get vwap data into series format
-    vwaps = dh.preprocess_historical_data(data)
-    # get bollinger bands
-    lower_band, upper_band = get_bands(vwaps, window_size, num_std_dev)
-
-    buys    = []
-    sells   = []
-    signals = []
-    signal  = 0
-
-    for i in range(0, len(vwaps)):
-        # buy
-        if vwaps[i-1] > lower_band[i-1] and vwaps[i] < lower_band[i]:
-            signal = handle_buy(signal, vwaps[i], buys, sells, signals)
-        # sell
-        elif vwaps[i-1] < upper_band[i-1] and vwaps[i] > upper_band[i]:
-            signal = handle_sell(signal, vwaps[i], buys, sells, signals)
-        # stay put
-        else:
-            handle_neutral(buys, sells, signals)
-
-    # transform the results from lists into a dataframe    
-    bb_results = dh.process_backtesting_results(vwaps, buys, sells, signals)
-
-    return bb_results
-
-
-def get_positions(signals):
-    positions = [signals[0]] * len(signals)
-
-    for i in range(1, len(signals)):
-        if signals[i] == 1:
-            positions[i] = 1
-        elif signals[i] == -1:
-            positions[i] = 0
-        else:
-            positions[i] = positions[i-1]            
-
-    return positions
-
-
-def buy_and_hold(data):
-    buy_price = data[0]
-    sell_price = data[len(data)-1]
-
-    return buy_price, sell_price
-
-
-def get_today():
-    return date.today().strftime('%Y-%m-%d')
-
-
-def get_yesterday():
-    yesterday = datetime.now() - timedelta(1)
-    return datetime.strftime(yesterday, '%Y-%m-%d')
-
-
-def start_stream(ticker, callback):
-    """
-        Starts a connection to retrieve real time data via Alpaca Markets API
-        Free mode retrieves data from iex exchange
+    def handle_trade_update(self, trade):
+        """
+        Called when previously submitted order got updated in the form of 
+        a trade
         Args:
-            ticker   - ticker specifying stock to be retrieved. Can be a string 
-                    or a list of strings containing multiple tickers
-            callback - callback function to be called. Can be a single callback
-                    or a list of callbacks 
-                    Callback what type of data is to be retrieved.
-                    Options: (1) trade
-                             (2) quote
-                             (3) bar
-                             (4) crypto trade
-    """
-    try:
-        loop = asyncio.get_event_loop()
-        loop.set_debug(True)
-    except RuntimeError:
-        asyncio.set_event_loop(asyncio.new_event_loop())
+            trade: alpaca's Trade object type
+                trade that specifies what happened with the order that 
+                initiated the trade
+        """
+        if trade.event == 'fill':
+            self._handle_filled_order(trade)
+        elif trade.event == 'partial_fill':
+            self._handle_partially_filled_order(trade)
+        elif trade.event == 'rejected' or trade.event == 'canceled':
+            self._handle_rejected_order(trade)
 
-    global stream
+
+    def handle_bar(self, bar):
+        """
+        Called when a new bar arrives
+        Args:
+            bar: pandas df
+                new bar of data
+        """
+        if self._bars is None:
+            self._initialize_bars()
+        if self._exchange is None:
+            self._exchange = bar.exchange
+
+        self._update_bars(bar)
+
+        log.info(f'bars: {self._bars}')
+
+        if (len(self._bars) >= self._window_size):                
+            self._execute_bollinger_bands()
+
+
+def start_subscriptions(stream, bb, instr_type):
+    """
+    Starts subscriptions that in turn start websockets via which the real
+    time data is retrieved
+    Args:
+        stream: Stream
+            starts websockets required for real time data retrieval and trading
+        bb: BollingerBands
+        instr_type: String
+            Specifies whether a stock or crypto is traded
+    """
+    async def on_crypto_bar(bar):
+        bb.handle_bar(bar)
+
+    async def on_bar(bar):
+        bb.handle_bar(bar)
+
+    async def on_trade_update(trade):
+        bb.handle_trade_update(trade)
+
+    if instr_type == "crypto":
+        stream.subscribe_crypto_bars(on_crypto_bar, bb.ticker)
+    elif instr_type == "stock":
+        stream.subscribe_bars(on_bar, bb.ticker)
+
+    stream.subscribe_trade_updates(on_trade_update)
+    stream.run()
+
+
+# function taken from: https://github.com/alpacahq/alpaca-trade-api-python
+def start_trading(bb, instr_type):
+    """
+    Starts the trading algorithm
+    Args:
+        bb: instance of BolingerBands
+        instr_type: String
+            Specifies whether a stock or crypto is traded
+    """
     stream = Stream(config.key_id, 
                 config.secret_key,
                 base_url=config.base_url,
                 data_feed='iex')
-
-    if type(ticker) == list or type(callback) == list:
-        start_multiple_subscriptions(ticker, callback)
-    else:
-        start_single_subscription(ticker, callback)
-
-    stream.run()
-
-
-def start_single_subscription(ticker, callback):
-    # stock
-    if callback == print_trade:
-        stream.subscribe_trades(callback, ticker)
-    elif callback == print_quote:
-        stream.subscribe_quotes(callback, ticker)
-    elif callback == print_bar:
-        stream.subscribe_bars(callback, ticker)
-    if callback == print_trade_update:
-        stream.subscribe_trade_updates(print_trade_update)
-    elif callback == print_daily_bar:
-        stream.subscribe_daily_bars(callback, ticker)
-
-    # crypto
-    elif callback == print_crypto_trade:
-        stream.subscribe_crypto_trades(callback, ticker)
-    elif callback == print_crypto_quote:
-        stream.subscribe_crypto_quotes(callback, ticker)
-    elif callback == print_crypto_daily_bar:
-        stream.subscribe_crypto_daily_bars(callback, ticker)
-    elif callback == print_crypto_bar:
-        stream.subscribe_crypto_bars(callback, ticker)
-
-
-def start_multiple_subscriptions(tickers, callbacks):
-    if type(tickers) == list and type(callbacks) == list:
-        assert len(tickers) == len(callbacks)
-        for i in range(len(tickers)):
-            start_single_subscription(tickers[i], callbacks[i])
-    if type(tickers) == list:
-        for i in range(len(tickers)):
-            start_single_subscription(tickers[i], callbacks)
-    if type(callbacks) == list:
-        for i in range(len(callbacks)):
-            start_single_subscription(tickers, callbacks[i])
-
-
-def get_real_time_data(ticker, callback):
-    logging.basicConfig(format='%(asctime)s  %(levelname)s %(message)s',
-                        level=logging.INFO)
 
     loop = asyncio.get_event_loop()
     executor = ThreadPoolExecutor(1)
 
     while 1:
         try:
-            executor.submit(start_stream(ticker, callback))
-            time.sleep(5)
+            executor.submit(start_subscriptions(stream, bb, instr_type))
             loop.run_until_complete(stream.stop_ws())
-            time.sleep(5)
         except KeyboardInterrupt:
-            print("Interrupted execution by user")
+            log.info("Interrupted execution by user")
             loop.run_until_complete(stream.stop_ws())
             exit(0)
         except Exception as e:
-            print("You got an exception: {} during execution. Continue "
+            log.info("You got an exception: {} during execution. Continue "
                   "execution.".format(e))
             # let the execution continue
             pass
 
 
-async def print_trade(t):
-    print('trade', t)
-
-
-async def print_quote(q):
-    print('quote', q)
-
-
-async def print_bar(bar):
-    print('bar', bar)
-
-
-async def print_daily_bar(bar):
-    print('daily bar', bar)
-
-async def print_crypto_trade(t):
-    print('crypto trade', t)
-
-
-async def print_crypto_quote(q):
-    print('crypto quote', q)
-
-
-async def print_crypto_bar(bar):
-    print('crypto bars', bar)
-
-
-async def print_crypto_daily_bar(daily_bar):
-    print('crypto daily bar', daily_bar)
-
-
-async def print_trade_update(t_update):
-    print('trade update', t_update)
-
-
-
 def main():
     ticker = "BTCUSD" #SPY #BTCUSD # AAPL
-    frequency = TimeFrame.Day
-    start_date = "2005-01-01"
-    end_date = "2022-01-21"
-    portfolio_size = 100000
-    callback = dh.print_trade_update # print_trade_update # print_quote # print_crypto_quote
-    tickers= ['BTCUSD', 'BTCUSD']
-    callbacks = [dh.print_crypto_bar, dh.print_trade_update] #dh.print_trade_update, 
+    portfolio_size = 10000
+    instr_type = "crypto"
 
+    logging.basicConfig(format='%(asctime)s %(message)s', level=logging.INFO)
+    global log
+    log = logging.getLogger()
+
+    # defined global so that it could be used for trading fin instruments
+    global api
     api = tradeapi.REST(
             key_id=config.key_id, 
             secret_key=config.secret_key, 
             base_url=config.base_url,
             api_version='v2')
 
-    api.submit_order(
-            symbol=ticker,
-            qty=0.1,
-            side='buy',
-            type='market',
-            time_in_force='gtc'
-        )
-
-    dh.get_real_time_data(ticker, callbacks)
-
-    """
-    global stream
-    while 1:
-        try:
-            try:
-                loop = asyncio.get_event_loop()
-                loop.set_debug(True)
-            except RuntimeError:
-                asyncio.set_event_loop(asyncio.new_event_loop())
-                
-            stream = Stream(config.key_id, 
-                            config.secret_key,
-                            base_url=config.base_url,
-                            data_feed='iex')
-
-            if type(ticker) == list or type(callback) == list:
-                start_multiple_subscriptions(ticker, callback)
-            else:
-                start_single_subscription(ticker, callback)
-
-            stream.run()
-
-            time.sleep(5)
-            loop.run_until_complete(stream.stop_ws())
-            time.sleep(5)
-        except KeyboardInterrupt:
-            print("Interrupted execution by user")
-            loop.run_until_complete(stream.stop_ws())
-            exit(0)
-        except Exception as e:
-            print("You got an exception: {} during execution. Continue "
-                  "execution.".format(e))
-            # let the execution continue
-            pass
-    """
-    
-
-
-
-
+    bb = BollingerBands(ticker, portfolio_size, window_size=21)
+    start_trading(bb, instr_type)
 
 main()
