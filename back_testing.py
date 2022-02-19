@@ -150,7 +150,6 @@ def get_bands(data, window_size=20, num_std=1):
     """
     std = data.rolling(window_size, min_periods=1).std()
     sma = data.rolling(window_size, min_periods=1).mean()
-    
 
     lower_bands = sma - num_std * std
     upper_bands = sma + num_std * std
@@ -263,8 +262,6 @@ def backtest_bollinger_bands(data, window_size=20, num_std=1):
     # get bollinger bands
     lower_band, upper_band = get_bands(vwaps, window_size, num_std)
 
-    print(f'lower band: {lower_band}')
-
     buys    = []
     sells   = []
     signals = []
@@ -272,10 +269,10 @@ def backtest_bollinger_bands(data, window_size=20, num_std=1):
 
     for i in range(0, len(vwaps)):
         # buy
-        if vwaps[i-1] > lower_band[i-1] and vwaps[i] < lower_band[i]:
+        if vwaps[i] < lower_band[i] and vwaps[i-1] > lower_band[i-1]: 
             signal = handle_buy(signal, vwaps[i], buys, sells, signals)
         # sell
-        elif vwaps[i-1] < upper_band[i-1] and vwaps[i] > upper_band[i]:
+        elif vwaps[i] > upper_band[i] and vwaps[i-1] < upper_band[i-1]:
             signal = handle_sell(signal, vwaps[i], buys, sells, signals)
         # stay put
         else:
@@ -297,3 +294,90 @@ def buy_and_hold(data):
     sell_price = data[len(data)-1]
 
     return buy_price, sell_price
+
+
+def calculate_profit_percentage(start_size, end_size):
+    return 100 * (end_size - start_size) / start_size
+
+
+def calculate_returns(portfolio_size, data):
+    """
+    Calculates returns of Bolinger Bands algorithm against historical data
+    Assumes a fractional number of shares can be purchased
+    """
+    for i in range(data.shape[0]):
+        # buy the asset
+        if data['signal'][i] == 1:
+            num_shares = portfolio_size / data['buy_price'][i]
+            log.info(f"Date: {data.index[i]}\
+                Bought {num_shares} shares at {data['buy_price'][i]}.\
+                Current portfolio value: {num_shares  * data['buy_price'][i]}")
+
+        # sell the asset
+        elif data['signal'][i] == -1:
+            portfolio_size = num_shares * data['sell_price'][i]
+            log.info(f"Date: {data.index[i]}\
+                Sold {num_shares} shares at {data['sell_price'][i]}.\
+                Current portfolio value: {num_shares  * data['sell_price'][i]}")
+
+    return portfolio_size
+
+def get_portfolio_size():
+    portfolio_size = input("Enter size of portfolio to trade with in $USD: ")
+    try:
+        portfolio_size = int(portfolio_size) + 0
+    except:
+        raise TypeError("Enter numerical value for portfolio size")
+
+    return portfolio_size
+
+def get_ticker():
+    ticker = input("Enter ticker to trade: ")
+    return ticker
+
+def get_start_date():
+    start_date = input("Enter start date in form YYYY-MM-DD: ")
+    return start_date
+
+def get_end_date():
+    end_date = input("Enter end date in form YYYY-MM-DD: ")
+    return end_date
+
+def get_inputs():
+    ticker = get_ticker()
+    portfolio_size = get_portfolio_size()
+    start_date = get_start_date()
+    end_date = get_end_date()
+
+    return ticker, portfolio_size, start_date, end_date
+
+
+def main():
+    logging.basicConfig(format='%(message)s', level=logging.INFO)
+    global log
+    log = logging.getLogger()
+
+    frequency = TimeFrame.Day
+    ticker, portfolio_size, start_date, end_date = get_inputs()
+
+    # Retrieve data from a csv file
+    #file_name = get_file_name(ticker, frequency, start_date, end_date)
+    #data = load_data(file_name)
+    
+    # Retrieve data directly via Alpaca api
+    data = get_historical_bar_data(ticker,
+                        frequency=frequency,
+                        start_date=start_date,
+                        end_date=end_date)
+    
+    bb_results = backtest_bollinger_bands(data, window_size=20,num_std=2)
+    end_port_size = calculate_returns(portfolio_size, bb_results)
+    bb_return = calculate_profit_percentage(portfolio_size, end_port_size)
+    log.info(f'Bollinger bands return: {bb_return}%')
+
+    hold_start_size, hold_end_size = buy_and_hold(data['vwap'])
+    baseline_return = calculate_profit_percentage(hold_start_size, hold_end_size)
+    log.info(f'Buy-and-hold return: {baseline_return}%')
+
+
+main()

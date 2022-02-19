@@ -309,7 +309,7 @@ class BollingerBands:
             self._execute_bollinger_bands()
 
 
-def start_subscriptions(stream, bb, instr_type):
+def start_subscriptions(stream, bb, instr_type, frequency="daily"):
     """
     Starts subscriptions that in turn start websockets via which the real
     time data is retrieved
@@ -320,26 +320,32 @@ def start_subscriptions(stream, bb, instr_type):
         instr_type: String
             Specifies whether a stock or crypto is traded
     """
-    async def on_crypto_bar(bar):
-        bb.handle_bar(bar)
-
-    async def on_bar(bar):
-        bb.handle_bar(bar)
-
     async def on_trade_update(trade):
         bb.handle_trade_update(trade)
+    async def on_crypto_bar(bar):
+        bb.handle_bar(bar)
+    async def on_bar(bar):
+        bb.handle_bar(bar)
+    async def on_daily_bar(bar):
+        bb.handle_bar(bar)
+    async def on_daily_crypto_bar(bar):
+        bb.handle_bar(bar)
 
-    if instr_type == "crypto":
+    if instr_type == "crypto" and frequency == "minute":
         stream.subscribe_crypto_bars(on_crypto_bar, bb.ticker)
-    elif instr_type == "stock":
+    if instr_type == "crypto" and frequency == "daily":
+        stream.subscribe_crypto_daily_bars(on_daily_crypto_bar, bb.ticker)
+    elif instr_type == "stock" and frequency == "minute":
         stream.subscribe_bars(on_bar, bb.ticker)
+    elif instr_type == "stock" and frequency == "daily":
+        stream.subscribe_crypto_daily_bars(on_daily_bar, bb.ticker)
 
     stream.subscribe_trade_updates(on_trade_update)
     stream.run()
 
 
 # function taken from: https://github.com/alpacahq/alpaca-trade-api-python
-def start_trading(bb, instr_type):
+def start_trading(bb, instr_type, frequency="daily"):
     """
     Starts the trading algorithm
     Args:
@@ -357,7 +363,7 @@ def start_trading(bb, instr_type):
 
     while 1:
         try:
-            executor.submit(start_subscriptions(stream, bb, instr_type))
+            executor.submit(start_subscriptions(stream, bb, instr_type, frequency))
             loop.run_until_complete(stream.stop_ws())
         except KeyboardInterrupt:
             log.info("Interrupted execution by user")
@@ -370,10 +376,41 @@ def start_trading(bb, instr_type):
             pass
 
 
+
+def get_portfolio_size():
+    portfolio_size = input("Enter size of portfolio to trade with in $USD: ")
+    try:
+        portfolio_size = int(portfolio_size) + 0
+    except:
+        raise TypeError("Enter numerical value for portfolio size")
+
+    return portfolio_size
+
+def get_ticker():
+    ticker = input("Enter ticker to trade: ")
+    return ticker
+
+def get_instrument_type():
+    instr_type = input("Enter instrument type. Options: (1) 'crypto' or  \
+       (2) 'stock' based on the type of instrument you want to trade: ")
+    
+    try:
+        assert instr_type == 'crypto' or instr_type == 'stock'
+    except:
+        raise TypeError("You entered an invalid instrument type")
+
+    return instr_type
+
+def get_inputs():
+    ticker = get_ticker()
+    portfolio_size = get_portfolio_size()
+    instr_type = get_instrument_type()
+    
+    return ticker, portfolio_size, instr_type
+
+
 def main():
-    ticker = "BTCUSD" #SPY #BTCUSD # AAPL
-    portfolio_size = 10000
-    instr_type = "crypto"
+    ticker, portfolio_size, instr_type =  get_inputs()
 
     logging.basicConfig(format='%(asctime)s %(message)s', level=logging.INFO)
     global log
@@ -387,7 +424,8 @@ def main():
             base_url=config.base_url,
             api_version='v2')
 
-    bb = BollingerBands(ticker, portfolio_size, window_size=21)
-    start_trading(bb, instr_type)
+    bb = BollingerBands(ticker, portfolio_size, window_size=20, num_std=2)
+    start_trading(bb, instr_type, frequency="daily")
+
 
 main()
