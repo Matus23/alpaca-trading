@@ -18,6 +18,7 @@ import logging
 import threading
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 
 # Script inspired by:
 # https://medium.com/codex/algorithmic-trading-with-bollinger-bands-in-python-1b0a00c9ef99
@@ -157,7 +158,7 @@ def get_bands(data, window_size=20, num_std=1):
     return lower_bands, upper_bands
 
 
-def handle_buy(signal, vwap, buys, sells, signals):
+def handle_buy(signal, vwap, buys, sells, signals, current_position):
     """
     Handles buy signal
     Args:
@@ -177,20 +178,21 @@ def handle_buy(signal, vwap, buys, sells, signals):
     Returns: 
         1 - indication that buy action would take place
     """
-    if signal != 1:
+    if signal != 1 and current_position == 0:
         buys.append(vwap)
         sells.append(np.nan)
         signal = 1
         signals.append(signal)
+        current_position = 1
     else:
         buys.append(np.nan)
         sells.append(np.nan)
         signals.append(0)
 
-    return 1
+    return signal, current_position
 
 
-def handle_sell(signal, vwap, buys, sells, signals):
+def handle_sell(signal, vwap, buys, sells, signals, current_position):
     """
     Handles sell signal
     Args:
@@ -210,17 +212,18 @@ def handle_sell(signal, vwap, buys, sells, signals):
     Returns: 
         -1 - indication that sell action would take place
     """
-    if signal != -1:
+    if signal != -1 and current_position == 1:
         buys.append(np.nan)
         sells.append(vwap)
         signal = -1
         signals.append(signal)
+        current_position = 0
     else:
         buys.append(np.nan)
         sells.append(np.nan)
         signals.append(0)
 
-    return signal
+    return signal, current_position
 
 
 def handle_neutral(buys, sells, signals):
@@ -267,13 +270,18 @@ def backtest_bollinger_bands(data, window_size=20, num_std=1):
     signals = []
     signal  = 0
 
+    # is 1 when long in the position, 0 when having cash in possession
+    current_position = 0
+
     for i in range(0, len(vwaps)):
         # buy
         if vwaps[i] < lower_band[i] and vwaps[i-1] > lower_band[i-1]: 
-            signal = handle_buy(signal, vwaps[i], buys, sells, signals)
+            signal, current_position = handle_buy(signal, vwaps[i], buys, sells, 
+                                        signals, current_position)
         # sell
         elif vwaps[i] > upper_band[i] and vwaps[i-1] < upper_band[i-1]:
-            signal = handle_sell(signal, vwaps[i], buys, sells, signals)
+            signal, current_position = handle_sell(signal, vwaps[i], buys, sells, 
+                                        signals, current_position)
         # stay put
         else:
             handle_neutral(buys, sells, signals)
@@ -287,8 +295,9 @@ def backtest_bollinger_bands(data, window_size=20, num_std=1):
 def buy_and_hold(data):
     """
     Executes a buy and hold strategy on historical bars data
-    data: pandas df
-        bar data of a certain instrument
+    Args:
+        data: pandas df
+            bar data of a certain instrument
     """
     buy_price = data[0]
     sell_price = data[len(data)-1]
@@ -296,7 +305,52 @@ def buy_and_hold(data):
     return buy_price, sell_price
 
 
+def calculate_rf_interest(rf_annual, start_date, end_date):
+    """
+    Calculates risk-free interest over the traded period
+    Args:
+        rf_annual: float
+            annual risk free interest rate
+        start_date: string
+            YYYY-MM-DD format
+        end_date: string
+            YYYY-MM-DD format
+    """
+    date_format = "%Y-%m-%d"
+    start = datetime.strptime(start_date, date_format)
+    end = datetime.strptime(end_date, date_format)
+    delta = end - start
+    delta_in_yrs = delta.days / 365
+
+    return ((1 + (rf_annual/100)) ** delta_in_yrs - 1) * 100
+
+
+def calculate_baseline_sharpe(data, rp, rf):
+    """
+    Calculates sharpe ratio for the baseline model (i.e. buy and hold)
+    Args:
+        data: pandas df
+            historical bar data about the traded instrument
+        rp: float
+            return of portfolio over the traded period in % form
+        rf: float
+            risk free rate of return over the trade period in % form
+    """
+    rp = rp/100
+    rf = rf/100
+    stdev = (len(data) ** 0.5) * data.vwap.pct_change(1).std()
+    return (rp - rf) / stdev
+
+
 def calculate_profit_percentage(start_size, end_size):
+    """
+    Calculates profit of a buy and hold in % form
+    Args:
+        start_size: float
+            starting portfolio size
+        end_size: float
+            ending portfolio size
+    """
     return 100 * (end_size - start_size) / start_size
 
 
@@ -343,13 +397,30 @@ def get_end_date():
     end_date = input("Enter end date in form YYYY-MM-DD: ")
     return end_date
 
+def get_frequency():
+    frequency = input("Enter frequency of data to backtest against. " +
+        "Options: (1) 'day', (2) 'hour', (3) 'minute': ")
+
+    try:
+        assert frequency == 'day' or frequency == 'hour' or frequency == 'minute'
+    except:
+        raise TypeError("You entered an invalid frequency")
+
+    if frequency == 'day':
+        return TimeFrame.Day
+    elif frequency == 'hour':
+        return TimeFrame.Hour
+    else:
+        return TimeFrame.Minute
+
 def get_inputs():
     ticker = get_ticker()
     portfolio_size = get_portfolio_size()
     start_date = get_start_date()
     end_date = get_end_date()
+    frequency = get_frequency()
 
-    return ticker, portfolio_size, start_date, end_date
+    return ticker, portfolio_size, start_date, end_date, frequency
 
 
 def main():
@@ -357,8 +428,11 @@ def main():
     global log
     log = logging.getLogger()
 
-    frequency = TimeFrame.Day
-    ticker, portfolio_size, start_date, end_date = get_inputs()
+    ticker, portfolio_size, start_date, end_date, frequency = get_inputs()
+
+    # risk-free annual interest rate
+    rf_annual = 1.47
+    rf = calculate_rf_interest(rf_annual, start_date, end_date)
 
     # Retrieve data from a csv file
     #file_name = get_file_name(ticker, frequency, start_date, end_date)
@@ -369,7 +443,7 @@ def main():
                         frequency=frequency,
                         start_date=start_date,
                         end_date=end_date)
-    
+
     bb_results = backtest_bollinger_bands(data, window_size=20,num_std=2)
     end_port_size = calculate_returns(portfolio_size, bb_results)
     bb_return = calculate_profit_percentage(portfolio_size, end_port_size)
@@ -377,7 +451,9 @@ def main():
 
     hold_start_size, hold_end_size = buy_and_hold(data['vwap'])
     baseline_return = calculate_profit_percentage(hold_start_size, hold_end_size)
-    log.info(f'Buy-and-hold return: {baseline_return}%')
+    baseline_sharpe = calculate_baseline_sharpe(data, baseline_return, rf)
+    log.info(f'Buy-and-hold return: {baseline_return}%. Sharpe: {baseline_sharpe}')
 
 
-main()
+if __name__ == "__main__":
+    main()

@@ -91,8 +91,10 @@ class BollingerBands:
                 end_date="01-01-2022"):
         self.ticker = ticker
         self._portfolio_size = portfolio_size
-        self._upper_band = 0
-        self._lower_band = 0
+        self._upper_band = None
+        self._prev_upper_band = None
+        self._lower_band = None
+        self._prev_lower_band = None
         self._quantity = 0
         self._order_state = None
         self._window_size = window_size
@@ -139,11 +141,20 @@ class BollingerBands:
         """
         Calculates the lower and upper bollinger bands
         """
+        self._prev_upper_band = self._upper_band
+        self._prev_lower_band = self._lower_band
+
         std = self._bars['vwap'].rolling(self._window_size, min_periods=1).std().iloc[-1]
         sma = self._bars['vwap'].rolling(self._window_size, min_periods=1).mean().iloc[-1]
 
         self._upper_band = sma + self._num_std * std
         self._lower_band = sma - self._num_std * std
+
+        # when initializing upper and lower bands (i.e. they were None in the 
+        # assignment above), make the previous bands the same
+        if self._prev_upper_band == None or self._prev_lower_band == None:
+            self._prev_upper_band = self._upper_band
+            self._prev_lower_band = self._lower_band
 
 
     def _sell(self):
@@ -235,10 +246,10 @@ class BollingerBands:
         self._calculate_bands()
 
         if self._current_price < self._lower_band \
-            and self._previous_price > self._lower_band:
+            and self._previous_price > self._prev_lower_band:
             self._buy()
         elif self._current_price > self._upper_band \
-            and self._previous_price < self._upper_band:
+            and self._previous_price < self._prev_upper_band:
             self._sell()
 
 
@@ -376,7 +387,6 @@ def start_trading(bb, instr_type, frequency="daily"):
             pass
 
 
-
 def get_portfolio_size():
     portfolio_size = input("Enter size of portfolio to trade with in $USD: ")
     try:
@@ -391,8 +401,8 @@ def get_ticker():
     return ticker
 
 def get_instrument_type():
-    instr_type = input("Enter instrument type. Options: (1) 'crypto' or  \
-       (2) 'stock' based on the type of instrument you want to trade: ")
+    instr_type = input("Enter instrument type. Options: (1) 'crypto' or " +
+       "(2) 'stock' based on the type of instrument you want to trade: ")
     
     try:
         assert instr_type == 'crypto' or instr_type == 'stock'
@@ -401,16 +411,28 @@ def get_instrument_type():
 
     return instr_type
 
+def get_frequency():
+    frequency = input("Enter frequency of data to backtest against. " +
+        "Options: (1) 'minute', (2) 'daily': ")
+
+    try:
+        assert frequency == 'minute' or frequency == 'daily'
+    except:
+        raise TypeError("You entered an invalid frequency")
+
+    return frequency
+
 def get_inputs():
     ticker = get_ticker()
     portfolio_size = get_portfolio_size()
     instr_type = get_instrument_type()
-    
-    return ticker, portfolio_size, instr_type
+    frequency = get_frequency()
+
+    return ticker, portfolio_size, instr_type, frequency
 
 
 def main():
-    ticker, portfolio_size, instr_type =  get_inputs()
+    ticker, portfolio_size, instr_type, frequency =  get_inputs()
 
     logging.basicConfig(format='%(asctime)s %(message)s', level=logging.INFO)
     global log
@@ -425,7 +447,8 @@ def main():
             api_version='v2')
 
     bb = BollingerBands(ticker, portfolio_size, window_size=20, num_std=2)
-    start_trading(bb, instr_type, frequency="daily")
+    start_trading(bb, instr_type, frequency=frequency)
 
 
-main()
+if __name__ == "__main__":
+    main()
